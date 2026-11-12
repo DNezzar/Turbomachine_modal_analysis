@@ -1,0 +1,15 @@
+P actions make_etude
+P version stable
+P mode interactif
+P ncpus 4
+P memory_limit 6000
+P time_limit 7200
+
+# Fichiers d'entrée (D = existe déjà)
+F comm modal_roue.comm D 1
+F mmed roue_aubagee.med D 20
+
+# Fichiers de sortie (R = sera créé)
+F mess modal_roue.mess R 6
+F resu modal_roue.resu R 8
+F rmed modal_roue.rmed R 80

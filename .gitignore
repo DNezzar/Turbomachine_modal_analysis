@@ -1,0 +1,9 @@
+# Environnement Python
+.venv/
+__pycache__/
+
+# Métadonnées Windows / WSL
+*:Zone.Identifier
+
+# Cache de l'extension VS Code code_aster
+.vs-code-aster/

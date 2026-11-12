@@ -1,0 +1,222 @@
+# =============================================================================
+# Roue aubagée : analyse modale à l'arrêt et en rotation
+#   - SANS précontrainte            : K            (roue à l'arrêt)
+#   - AVEC raidissement centrifuge  : K + Kg(sigma) (stress stiffening)
+#   - option : assouplissement centrifuge K_rota (spin softening)
+#
+# Maillage : roue_aubagee.med (roue_aubagee.py)   Axe de rotation : Z
+# Unités   : mm, t, s  ->  MPa, t/mm3, N, rad/s, Hz
+#
+# Le noeud CENTRE (sur l'axe) porte 6 ddl (élément discret DIS_TR). Il est
+# relié à l'alésage, puis encastré : il n'y a besoin que d'UN noeud, parce
+# qu'il porte aussi les rotations. La rotation de la roue n'est pas imposée
+# comme un déplacement : c'est un chargement volumique centrifuge
+# (mot-clé ROTATION), calculé dans le repère tournant.
+# =============================================================================
+from math import pi
+
+DEBUT()
+
+# -----------------------------------------------------------------------------
+# Paramètres
+# -----------------------------------------------------------------------------
+N_TR_MIN = 10000.0                  # vitesse de rotation (tr/min)
+OMEGA = N_TR_MIN * 2.0 * pi / 60.0  # (rad/s)
+NB_MODES = 20                       # nombre de modes par calcul
+
+E = 110000.0                        # TA6V : module d'Young (MPa)
+NU = 0.31
+RHO = 4.43e-9                       # masse volumique (t/mm3)
+
+# Liaison CENTRE <-> ALESAGE :
+#   'SOLIDE' : alésage rigide (encastrement strict, l'alésage ne peut pas
+#              se dilater sous l'effet centrifuge)
+#   'RBE3'   : le noeud CENTRE suit le mouvement MOYEN de l'alésage, qui
+#              reste libre de se dilater (pas de surcontrainte au moyeu)
+LIAISON = 'SOLIDE'
+
+# Ajouter l'assouplissement centrifuge (-Omega^2 M dans le plan de rotation)
+# au calcul précontraint. False = effet du raidissement géométrique seul.
+ASSOUPLISSEMENT = False
+
+VOLUMES = ('DISQUE', 'PALES')
+
+# -----------------------------------------------------------------------------
+# Maillage, modèle, matériau
+# -----------------------------------------------------------------------------
+MAIL = LIRE_MAILLAGE(FORMAT='MED', UNITE=20)
+
+MAIL = DEFI_GROUP(
+    reuse=MAIL,
+    MAILLAGE=MAIL,
+    CREA_GROUP_NO=(
+        _F(GROUP_MA='CENTRE', NOM='N_CENTRE'),
+        _F(GROUP_MA='ALESAGE', NOM='N_ALESAGE'),
+        _F(UNION=('N_CENTRE', 'N_ALESAGE'), NOM='N_RIGIDE'),
+    ),
+)
+
+MODELE = AFFE_MODELE(
+    MAILLAGE=MAIL,
+    AFFE=(
+        _F(GROUP_MA=VOLUMES, PHENOMENE='MECANIQUE', MODELISATION='3D'),
+        _F(GROUP_MA='CENTRE', PHENOMENE='MECANIQUE', MODELISATION='DIS_TR'),
+    ),
+)
+
+# Discret sans raideur ni masse : il ne sert qu'à porter les 6 ddl du noeud
+CARA = AFFE_CARA_ELEM(
+    MODELE=MODELE,
+    DISCRET=(
+        _F(GROUP_MA='CENTRE', CARA='K_TR_D_N', VALE=(0.0,) * 6),
+        _F(GROUP_MA='CENTRE', CARA='M_TR_D_N', VALE=(0.0,) * 10),
+    ),
+)
+
+MAT = DEFI_MATERIAU(ELAS=_F(E=E, NU=NU, RHO=RHO))
+
+CHMAT = AFFE_MATERIAU(MAILLAGE=MAIL, AFFE=_F(GROUP_MA=VOLUMES, MATER=MAT))
+
+# -----------------------------------------------------------------------------
+# Conditions aux limites et chargement
+# -----------------------------------------------------------------------------
+if LIAISON == 'SOLIDE':
+    LIEN = AFFE_CHAR_MECA(
+        MODELE=MODELE,
+        LIAISON_SOLIDE=_F(GROUP_NO='N_RIGIDE'),
+    )
+else:
+    LIEN = AFFE_CHAR_MECA(
+        MODELE=MODELE,
+        LIAISON_RBE3=_F(
+            GROUP_NO_MAIT='N_CENTRE',
+            DDL_MAIT=('DX', 'DY', 'DZ', 'DRX', 'DRY', 'DRZ'),
+            GROUP_NO_ESCL='N_ALESAGE',
+            DDL_ESCL='DX-DY-DZ',
+            COEF_ESCL=1.0,
+        ),
+    )
+
+# Encastrement du noeud central
+ENCAS = AFFE_CHAR_MECA(
+    MODELE=MODELE,
+    DDL_IMPO=_F(GROUP_NO='N_CENTRE',
+                DX=0.0, DY=0.0, DZ=0.0, DRX=0.0, DRY=0.0, DRZ=0.0),
+)
+
+# Chargement centrifuge (repère tournant) autour de Z passant par l'origine
+ROTA = AFFE_CHAR_MECA(
+    MODELE=MODELE,
+    ROTATION=_F(GROUP_MA=VOLUMES, VITESSE=OMEGA,
+                AXE=(0.0, 0.0, 1.0), CENTRE=(0.0, 0.0, 0.0)),
+)
+
+# -----------------------------------------------------------------------------
+# 1. Calcul statique sous chargement centrifuge -> contraintes de précharge
+# -----------------------------------------------------------------------------
+STAT = MECA_STATIQUE(
+    MODELE=MODELE,
+    CHAM_MATER=CHMAT,
+    CARA_ELEM=CARA,
+    EXCIT=(_F(CHARGE=LIEN), _F(CHARGE=ENCAS), _F(CHARGE=ROTA)),
+)
+
+# SIEF_ELGA est déjà calculé par MECA_STATIQUE ; on ajoute von Mises aux noeuds
+STAT = CALC_CHAMP(
+    reuse=STAT,
+    RESULTAT=STAT,
+    GROUP_MA=VOLUMES,
+    CRITERES=('SIEQ_NOEU',),
+)
+
+SIGMA = CREA_CHAMP(
+    TYPE_CHAM='ELGA_SIEF_R',
+    OPERATION='EXTR',
+    RESULTAT=STAT,
+    NOM_CHAM='SIEF_ELGA',
+    NUME_ORDRE=1,
+)
+
+# -----------------------------------------------------------------------------
+# 2. Matrices : raideur élastique, masse, raideur géométrique (+ rotation)
+# -----------------------------------------------------------------------------
+matrices = [
+    _F(MATRICE=CO('K_ELAS'), OPTION='RIGI_MECA'),
+    _F(MATRICE=CO('MASSE'), OPTION='MASS_MECA'),
+    _F(MATRICE=CO('K_GEOM'), OPTION='RIGI_GEOM', SIEF_ELGA=SIGMA),
+]
+if ASSOUPLISSEMENT:
+    matrices.append(_F(MATRICE=CO('K_ROTA'), OPTION='RIGI_ROTA'))
+
+ASSEMBLAGE(
+    MODELE=MODELE,
+    CHAM_MATER=CHMAT,
+    CARA_ELEM=CARA,
+    CHARGE=(LIEN, ENCAS, ROTA),
+    NUME_DDL=CO('NUME'),
+    MATR_ASSE=matrices,
+)
+
+# Raideur tangente en rotation : K + Kg (+ K_rota)
+termes = [
+    _F(MATR_ASSE=K_ELAS, COEF_R=1.0),
+    _F(MATR_ASSE=K_GEOM, COEF_R=1.0),
+]
+if ASSOUPLISSEMENT:
+    termes.append(_F(MATR_ASSE=K_ROTA, COEF_R=1.0))
+
+K_PREC = COMB_MATR_ASSE(COMB_R=termes)
+
+# -----------------------------------------------------------------------------
+# 3. Analyses modales
+# -----------------------------------------------------------------------------
+MODE_0 = CALC_MODES(
+    MATR_RIGI=K_ELAS,
+    MATR_MASS=MASSE,
+    OPTION='PLUS_PETITE',
+    CALC_FREQ=_F(NMAX_FREQ=NB_MODES),
+)
+
+MODE_P = CALC_MODES(
+    MATR_RIGI=K_PREC,
+    MATR_MASS=MASSE,
+    OPTION='PLUS_PETITE',
+    CALC_FREQ=_F(NMAX_FREQ=NB_MODES),
+)
+
+# -----------------------------------------------------------------------------
+# 4. Post-traitement
+# -----------------------------------------------------------------------------
+# Comparaison des fréquences, mode à mode par rang (les familles de modes
+# d'une roue à N pales sont très denses : l'ordre peut changer avec Omega)
+f_0 = MODE_0.getAccessParameters()['FREQ']
+f_p = MODE_P.getAccessParameters()['FREQ']
+n = min(len(f_0), len(f_p))
+
+TAB = CREA_TABLE(
+    TITRE='Frequences propres (Hz) a %.0f tr/min - liaison %s%s'
+          % (N_TR_MIN, LIAISON, ' + assouplissement' if ASSOUPLISSEMENT else ''),
+    LISTE=(
+        _F(PARA='MODE', LISTE_I=list(range(1, n + 1))),
+        _F(PARA='F_ARRET', LISTE_R=list(f_0[:n])),
+        _F(PARA='F_PRECONTRAINT', LISTE_R=list(f_p[:n])),
+        _F(PARA='ECART_PCT',
+           LISTE_R=[100.0 * (b - a) / a for a, b in zip(f_0[:n], f_p[:n])]),
+    ),
+)
+
+IMPR_TABLE(TABLE=TAB, UNITE=8, FORMAT_R='F12.3')
+
+IMPR_RESU(
+    FORMAT='MED',
+    UNITE=80,
+    RESU=(
+        _F(RESULTAT=STAT, GROUP_MA=VOLUMES, NOM_CHAM=('DEPL', 'SIEQ_NOEU')),
+        _F(RESULTAT=MODE_0, GROUP_MA=VOLUMES, NOM_CHAM='DEPL',
+           NOM_CHAM_MED='MODES_ARRET'),
+        _F(RESULTAT=MODE_P, GROUP_MA=VOLUMES, NOM_CHAM='DEPL',
+           NOM_CHAM_MED='MODES_PRECONTRAINT'),
+    ),
+)
+
+FIN()
